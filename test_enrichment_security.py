@@ -1115,3 +1115,146 @@ class TestPdfIdentityEvidence(unittest.TestCase):
         )
         self.assertEqual(links, [])
 
+
+
+class TestRecruitmentDiscovery(unittest.TestCase):
+
+    def test_detects_generic_url_with_recruitment_label(self):
+        soup = BeautifulSoup(
+            '<a href="/about">Recrutement</a>',
+            "html.parser",
+        )
+
+        links = enrichment.explicit_recruitment_links(
+            soup,
+            "https://example.com/",
+            "example.com",
+        )
+
+        self.assertEqual(links, ["https://example.com/about"])
+
+    def test_detects_nous_rejoindre_label(self):
+        soup = BeautifulSoup(
+            '<a href="/team">Nous rejoindre</a>',
+            "html.parser",
+        )
+
+        links = enrichment.explicit_recruitment_links(
+            soup,
+            "https://example.com/",
+            "example.com",
+        )
+
+        self.assertEqual(links, ["https://example.com/team"])
+
+    def test_rejects_external_link_from_official_homepage(self):
+        soup = BeautifulSoup(
+            '<a href="https://other.example/jobs">Recrutement</a>',
+            "html.parser",
+        )
+
+        links = enrichment.explicit_recruitment_links(
+            soup,
+            "https://example.com/",
+            "example.com",
+        )
+
+        self.assertEqual(links, [])
+
+    def test_accepts_company_recruitment_portal_candidate(self):
+        candidate = enrichment._recruitment_search_candidate(
+            "https://recrutement.bpce.fr/offres-emploi/",
+            "BPCE - Nos offres de recrutement",
+            "Découvrez les offres d'emploi BPCE",
+            ["bpce", "solutions"],
+        )
+
+        self.assertEqual(
+            candidate,
+            "https://recrutement.bpce.fr/offres-emploi/",
+        )
+
+    def test_rejects_unrelated_company_recruitment_result(self):
+        candidate = enrichment._recruitment_search_candidate(
+            "https://recrutement.example.org/offres-emploi/",
+            "Recrutement et offres d'emploi",
+            "Découvrez nos postes disponibles",
+            ["bpce"],
+        )
+
+        self.assertEqual(candidate, "")
+
+    def test_rejects_generic_job_board(self):
+        candidate = enrichment._recruitment_search_candidate(
+            "https://www.indeed.com/jobs/",
+            "BPCE recrutement",
+            "Offres d'emploi BPCE",
+            ["bpce"],
+        )
+
+        self.assertEqual(candidate, "")
+
+    @patch(
+        "search.enrichment._fetch_pinned_page",
+        return_value=(
+            "https://experisfrance.fr/",
+            "text/html",
+            "<html><head><title>Experis recrutement</title></head>"
+            "<body>Experis recrute et propose des offres d'emploi "
+            "et des postes en alternance.</body></html>",
+        ),
+    )
+    def test_rejects_company_homepage_as_recruitment_portal(self, mock_fetch):
+        result = enrichment._verify_recruitment_candidates(
+            ["https://experisfrance.fr/"],
+            ["experis"],
+        )
+
+        self.assertEqual(result, "")
+        mock_fetch.assert_called_once_with(
+            "https://experisfrance.fr/",
+            "experisfrance.fr",
+        )
+
+    @patch(
+        "search.enrichment._fetch_pinned_page",
+        return_value=(
+            "https://recrutement.bpce.fr/offres-emploi/",
+            "text/html",
+            "<html><head><title>BPCE recrutement</title></head>"
+            "<body>BPCE propose plusieurs offres d'emploi "
+            "et des postes en alternance.</body></html>",
+        ),
+    )
+    def test_verifies_external_portal_content(self, mock_fetch):
+        result = enrichment._verify_recruitment_candidates(
+            ["https://recrutement.bpce.fr/offres-emploi/"],
+            ["bpce"],
+        )
+
+        self.assertEqual(
+            result,
+            "https://recrutement.bpce.fr/offres-emploi/",
+        )
+        mock_fetch.assert_called_once_with(
+            "https://recrutement.bpce.fr/offres-emploi/",
+            "recrutement.bpce.fr",
+        )
+
+    @patch(
+        "search.enrichment._fetch_pinned_page",
+        return_value=(
+            "https://recrutement.example.org/offres-emploi/",
+            "text/html",
+            "<html><head><title>Recrutement</title></head>"
+            "<body>Offres d'emploi et alternance.</body></html>",
+        ),
+    )
+    def test_rejects_external_portal_without_company_identity(self, mock_fetch):
+        result = enrichment._verify_recruitment_candidates(
+            ["https://recrutement.example.org/offres-emploi/"],
+            ["bpce"],
+        )
+
+        self.assertEqual(result, "")
+        mock_fetch.assert_called_once()

@@ -168,6 +168,280 @@ def page_text(html):
     return soup, title, description, text
 
 
+
+def explicit_recruitment_links(soup, base_url, expected_host):
+    """Repère les liens de recrutement grâce à leur libellé visible."""
+    candidates = []
+
+    for link in soup.find_all("a", href=True):
+        label = normalize(link.get_text(" ", strip=True)).replace(" ", "-")
+
+        if not any(word in label for word in CAREER_WORDS):
+            continue
+
+        url = safe_official_url(urljoin(base_url, link["href"]))
+        if not url:
+            continue
+
+        parsed = urlsplit(url)
+
+        if parsed.scheme != "https" or not same_host(url, expected_host):
+            continue
+
+        if parsed.path.lower().endswith((
+            ".pdf", ".jpg", ".jpeg", ".png", ".webp",
+            ".zip", ".doc", ".docx",
+        )):
+            continue
+
+        clean_url = urlunsplit((
+            parsed.scheme, parsed.netloc, parsed.path, parsed.query, ""
+        ))
+
+        if clean_url not in candidates:
+            candidates.append(clean_url)
+
+    return candidates
+
+
+def _has_recruitment_signal(text):
+    """Détecte les termes indiquant une page dédiée au recrutement."""
+    normalized = normalize(text).replace(" ", "-")
+    extra_words = (
+        "nous-rejoindre", "rejoindre", "recrute",
+        "recrutement", "carriere", "carrieres",
+        "emploi", "emplois", "alternance",
+        "apprentissage", "offres-emploi",
+        "jobs", "careers", "talents",
+    )
+    return any(word in normalized for word in CAREER_WORDS + extra_words)
+
+
+def _has_job_offer_signal(text):
+    """Vérifie que le contenu évoque concrètement des postes ou des offres."""
+    normalized = normalize(text).replace(" ", "-")
+    offer_words = (
+        "offre-d-emploi", "offres-d-emploi",
+        "offres-emploi", "poste-a-pourvoir",
+        "postes-a-pourvoir", "alternance",
+        "apprentissage", "job-opening",
+        "job-opportunity", "vacancies",
+        "candidater", "postuler",
+    )
+    return any(word in normalized for word in offer_words)
+
+
+def _has_recruitment_location(url):
+    """Une page doit être située sur un chemin ou sous-domaine carrière."""
+    parsed = urlsplit(url)
+    location = f"{parsed.hostname or ''} {parsed.path}"
+    return _has_recruitment_signal(location)
+
+
+def _recruitment_search_candidate(url, title, snippet, tokens):
+    """Filtre les résultats avant toute connexion au portail."""
+    safe_url = safe_official_url(url)
+    if not safe_url:
+        return ""
+
+    parsed = urlsplit(safe_url)
+    host = (parsed.hostname or "").casefold().rstrip(".")
+
+    if parsed.scheme != "https" or not host or ignored_domain(host):
+        return ""
+
+    evidence = f"{host} {title} {snippet} {parsed.path}"
+    location_evidence = f"{host} {parsed.path} {title}"
+
+    identity_matches = [
+        token for token in tokens
+        if len(normalize(token)) >= 4 and contains_identity(evidence, token)
+    ]
+
+    if (
+        not identity_matches
+        or not _has_recruitment_signal(location_evidence)
+    ):
+        return ""
+
+    return safe_url
+
+
+def discover_recruitment_url(
+    company,
+    locality,
+    legal_name="",
+    brand="",
+    official_website="",
+):
+    """Recherche un portail de recrutement puis vérifie son contenu réel."""
+    tokens = company_tokens(company, legal_name, brand)
+    if not tokens:
+        return ""
+
+    names = list(dict.fromkeys(
+        name.strip()
+        for name in (brand, legal_name, company)
+        if name and name.strip()
+    ))
+
+    queries = []
+    for name in names:
+        queries.extend((
+            f'"{name}" "{locality}" recrutement',
+            f'"{name}" carrières alternance',
+            f'"{name}" "nous rejoindre"',
+        ))
+
+    queries = list(dict.fromkeys(queries))[:9]
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    }
+
+    candidates = []
+
+    def add_candidate(url, title, snippet):
+        candidate = _recruitment_search_candidate(
+            url, title, snippet, tokens
+        )
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    # 1. SearXNG en priorité.
+    if SEARXNG_URL:
+        for query in queries:
+            try:
+                response = requests.get(
+                    f"{SEARXNG_URL}/search",
+                    params={
+                        "q": query,
+                        "format": "json",
+                        "language": "fr-FR",
+                    },
+                    headers=headers,
+                    timeout=REQUEST_TIMEOUT,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                if not isinstance(data, dict):
+                    continue
+
+                results = data.get("results", [])
+                if not isinstance(results, list):
+                    continue
+
+                for item in results:
+                    if not isinstance(item, dict):
+                        continue
+                    add_candidate(
+                        item.get("url", ""),
+                        item.get("title", ""),
+                        item.get("content", ""),
+                    )
+
+            except (requests.RequestException, ValueError) as error:
+                print(
+                    "Recherche recrutement SearXNG : "
+                    f"{type(error).__name__}"
+                )
+
+        verified = _verify_recruitment_candidates(candidates, tokens)
+        if verified:
+            return verified
+
+    # 2. Bing en secours si aucun portail SearXNG n'a été vérifié.
+    for query in queries:
+        try:
+            response = requests.get(
+                "https://www.bing.com/search",
+                params={"q": query, "count": 10},
+                headers={
+                    **headers,
+                    "User-Agent": (
+                        "Mozilla/5.0 (X11; Linux x86_64) "
+                        "AppleWebKit/537.36 Chrome/130.0.0.0 "
+                        "Safari/537.36"
+                    ),
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, "html.parser")
+
+            for block in soup.select("li.b_algo"):
+                heading = block.select_one("h2")
+                link = heading.find("a", href=True) if heading else None
+                if not link:
+                    continue
+
+                url = resolve_bing_result_url(link.get("href", ""))
+                snippet = (
+                    block.select_one(".b_caption p")
+                    or block.select_one(".b_snippet")
+                )
+
+                add_candidate(
+                    url,
+                    heading.get_text(" ", strip=True),
+                    snippet.get_text(" ", strip=True) if snippet else "",
+                )
+
+        except requests.RequestException as error:
+            print(f"Recherche recrutement Bing : {type(error).__name__}")
+
+    return _verify_recruitment_candidates(candidates, tokens)
+
+
+def _verify_recruitment_candidates(candidates, tokens):
+    """Accepte uniquement un portail HTTPS public dont le contenu confirme l'entreprise."""
+    for candidate in candidates[:10]:
+        host = urlsplit(candidate).hostname or ""
+        print(f"Vérification du portail de recrutement : {candidate}")
+
+        try:
+            final_url, content_type, html = _fetch_pinned_page(
+                candidate, host
+            )
+
+            if "text/html" not in content_type:
+                continue
+
+            soup, title, description, text = page_text(html)
+            evidence = f"{title} {description} {text}"
+
+            has_identity = any(
+                len(normalize(token)) >= 4
+                and contains_identity(evidence, token)
+                for token in tokens
+            )
+
+            recruitment_location = _has_recruitment_location(final_url)
+            has_job_offers = _has_job_offer_signal(
+                f"{title} {description} {text}"
+            )
+
+            if not has_identity or not recruitment_location or not has_job_offers:
+                print(
+                    "Portail rejeté : identité, page carrière "
+                    "ou offres non confirmées."
+                )
+                continue
+
+            print(f"Portail de recrutement vérifié : {final_url}")
+            return final_url
+
+        except (requests.RequestException, ValueError, OSError) as error:
+            print(
+                "Portail non vérifié : "
+                f"{type(error).__name__}"
+            )
+
+    return ""
+
+
 def relevant_links(soup, base_url, expected_host):
     candidates = []
 
@@ -493,6 +767,7 @@ def analyse_website(website, skills):
     collected_text = []
     page_count = 0
     errors = 0
+    recruitment_candidates = set()
 
     try:
         while queue and page_count < MAX_PAGES:
@@ -523,7 +798,11 @@ def analyse_website(website, skills):
                 normalized_url = normalize(final_url)
                 if (
                     not result["recruitment_url"]
-                    and any(word in normalized_url for word in CAREER_WORDS)
+                    and (
+                        any(word in normalized_url for word in CAREER_WORDS)
+                        or current_url in recruitment_candidates
+                        or final_url in recruitment_candidates
+                    )
                 ):
                     result["recruitment_url"] = final_url
 
@@ -534,9 +813,17 @@ def analyse_website(website, skills):
                     result["contact_url"] = final_url
 
                 if current_url == original_url:
-                    for candidate in relevant_links(
+                    explicit_links = explicit_recruitment_links(
                         soup, final_url, host
-                    ):
+                    )
+                    recruitment_candidates.update(explicit_links)
+
+                    page_links = list(dict.fromkeys(
+                        relevant_links(soup, final_url, host)
+                        + explicit_links
+                    ))
+
+                    for candidate in page_links:
                         if candidate not in visited and candidate not in queue:
                             queue.append(candidate)
 
@@ -1489,9 +1776,19 @@ def save_enrichment(prospect_id, data):
         ))
 
 
-def enrich_prospects(limit=None, dry_run=False):
+def enrich_prospects(limit=None, dry_run=False, prospect_id=None):
     all_prospects = get_prospects()
     prospects = []
+
+    if prospect_id is not None:
+        all_prospects = [
+            prospect for prospect in all_prospects
+            if prospect["id"] == prospect_id
+        ]
+
+        if not all_prospects:
+            print(f"Prospect #{prospect_id} introuvable.")
+            return
 
     # Filtrage géographique avant application de --limit.
     for prospect in all_prospects:
@@ -1561,6 +1858,16 @@ def enrich_prospects(limit=None, dry_run=False):
         else:
             data = analyse_website("", skills)
             data["verification_status"] = discovery_status
+
+        if not data["recruitment_url"]:
+            print("Recherche d'un portail de recrutement externe...")
+            data["recruitment_url"] = discover_recruitment_url(
+                prospect["company"],
+                locality,
+                legal_name=prospect["legal_name"],
+                brand=prospect["brand"],
+                official_website=data["official_website"],
+            )
 
         print(f"État : {data['verification_status']}")
         print(f"Site officiel : {data['official_website'] or 'non confirmé'}")
