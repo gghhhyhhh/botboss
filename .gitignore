@@ -1,0 +1,33 @@
+# Environnement Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Secrets et configuration locale
+.env
+.env.*
+!.env.example
+
+# Bases de données et sauvegardes
+*.db
+*.sqlite
+*.sqlite3
+*.db-*
+backups/
+backup*/
+*.bak
+*.bak*
+*.bak_*
+*.backup*
+*.backup_*
+
+# Données personnelles
+profile/profile.json
+profile/cv.pdf
+
+# Journaux et fichiers temporaires
+*.log
+.DS_Store
+.vscode/
+.pytest_cache/
