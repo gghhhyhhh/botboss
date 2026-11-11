@@ -419,14 +419,10 @@ def _verify_recruitment_candidates(candidates, tokens):
             )
 
             recruitment_location = _has_recruitment_location(final_url)
-            has_job_offers = _has_job_offer_signal(
-                f"{title} {description} {text}"
-            )
-
-            if not has_identity or not recruitment_location or not has_job_offers:
+            if not has_identity or not recruitment_location:
                 print(
-                    "Portail rejeté : identité, page carrière "
-                    "ou offres non confirmées."
+                    "Portail rejeté : identité ou page carrière "
+                    "non confirmée."
                 )
                 continue
 

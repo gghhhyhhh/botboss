@@ -1244,6 +1244,30 @@ class TestRecruitmentDiscovery(unittest.TestCase):
     @patch(
         "search.enrichment._fetch_pinned_page",
         return_value=(
+            "https://recrutement.bpce.fr/offres-emploi/",
+            "text/html",
+            "<html><head><title>BPCE recrutement</title></head>"
+            "<body>Bienvenue sur le portail carrière du groupe BPCE."
+            "</body></html>",
+        ),
+    )
+    def test_accepts_verified_portal_without_visible_job_offers(
+        self, mock_fetch
+    ):
+        result = enrichment._verify_recruitment_candidates(
+            ["https://recrutement.bpce.fr/offres-emploi/"],
+            ["bpce"],
+        )
+
+        self.assertEqual(
+            result,
+            "https://recrutement.bpce.fr/offres-emploi/",
+        )
+        mock_fetch.assert_called_once()
+
+    @patch(
+        "search.enrichment._fetch_pinned_page",
+        return_value=(
             "https://recrutement.example.org/offres-emploi/",
             "text/html",
             "<html><head><title>Recrutement</title></head>"

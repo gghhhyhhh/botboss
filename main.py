@@ -172,9 +172,11 @@ def main():
                      help="Afficher sans enregistrer")
     enrich = sub.add_parser("enrich", help="Enrichir les informations des entreprises")
     enrich.add_argument("--limit", type=int, default=None,
-                        help="Limiter le nombre de prospects analysés")
+                    help="Limiter le nombre de prospects analysés")
+    enrich.add_argument("--prospect-id", type=int, default=None,
+                    help="Analyser un prospect précis")
     enrich.add_argument("--dry-run", action="store_true",
-                        help="Analyser sans enregistrer les résultats")
+                    help="Analyser sans enregistrer les résultats")
 
     spontaneous = sub.add_parser(
         "spontaneous",
@@ -295,6 +297,7 @@ def main():
         enrich_prospects(
             limit=args.limit,
             dry_run=args.dry_run,
+            prospect_id=args.prospect_id,
         )
     elif args.command == "offers":
         show_offers(args.status)
@@ -518,8 +521,13 @@ Cordialement,
         if not offer:
             raise SystemExit("Annonce introuvable.")
 
-        if offer["status"] != "to_verify":
-            raise SystemExit("Cette annonce n'est pas dans le statut to_verify.")
+        if offer["human_verified"] == 1:
+            raise SystemExit("Cette annonce a déjà été vérifiée manuellement.")
+
+        if offer["status"] not in ("to_verify", "pending"):
+            raise SystemExit(
+                "Cette annonce ne peut pas être vérifiée dans son statut actuel."
+            )
 
         parsed_url = urlsplit(offer["url"])
         if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
@@ -549,6 +557,18 @@ Cordialement,
         offer = get_offer(args.id)
         if not offer:
             raise SystemExit("Annonce introuvable.")
+
+        if offer["human_verified"] != 1:
+            raise SystemExit(
+                "Action bloquée : cette annonce doit d'abord passer "
+                "la vérification manuelle avec la commande verify."
+            )
+
+        if offer["status"] != "pending":
+            raise SystemExit(
+                "Action bloquée : seule une annonce vérifiée en attente "
+                "peut être approuvée."
+            )
 
         if not is_published_offer(offer):
             raise SystemExit(

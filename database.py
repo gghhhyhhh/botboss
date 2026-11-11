@@ -155,8 +155,8 @@ def save_offer(item):
         conn.execute("""
             INSERT INTO offers
             (title, company, url, snippet, location, source_domain, source_type,
-             matched_skills, score, tailored_message)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             matched_skills, score, tailored_message, status, human_verified)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'to_verify', 0)
             ON CONFLICT(url) DO UPDATE SET
                 title = excluded.title,
                 company = excluded.company,
@@ -167,7 +167,8 @@ def save_offer(item):
                 matched_skills = excluded.matched_skills,
                 score = excluded.score,
                 tailored_message = excluded.tailored_message
-            WHERE offers.status = 'pending'
+            WHERE offers.status IN ('to_verify', 'pending')
+              AND offers.human_verified = 0
         """, (
             item["title"],
             item.get("company", ""),
