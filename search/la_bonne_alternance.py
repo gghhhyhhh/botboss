@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 import os
 import re
 import unicodedata
@@ -15,7 +16,7 @@ API_URL = "https://api.apprentissage.beta.gouv.fr/api/job/v1/search"
 # Seine-Maritime et Somme uniquement.
 DEPARTMENTS = ["76", "80"]
 
-ROME_CODES = "M1805"
+ROME_CODES = ["M1805", "M1858"]
 
 EXCLUDED_COMPANY_TERMS = [
     "cfa ",
@@ -59,6 +60,60 @@ PROSPECT_NAF_SCORES = {
 
 
 
+
+def is_offer_available(offer, now=None):
+    """
+    Vérifie qu'une offre est active et n'a pas expiré.
+    Une date d'expiration absente n'entraîne pas de rejet.
+    """
+    if not isinstance(offer, dict):
+        return False
+
+    status = str(offer.get("status") or "").strip().lower()
+
+    if status != "active":
+        return False
+
+    publication = offer.get("publication")
+
+    if publication is None:
+        publication = {}
+
+    if not isinstance(publication, dict):
+        return False
+
+    expiration = publication.get("expiration")
+
+    if expiration is None or expiration == "":
+        return True
+
+    if not isinstance(expiration, str):
+        return False
+
+    try:
+        expiration_date = datetime.fromisoformat(
+            expiration.replace("Z", "+00:00")
+        )
+
+        if expiration_date.tzinfo is None:
+            expiration_date = expiration_date.replace(
+                tzinfo=timezone.utc
+            )
+
+        current_time = now or datetime.now(timezone.utc)
+
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(
+                tzinfo=timezone.utc
+            )
+
+        return expiration_date > current_time.astimezone(timezone.utc)
+
+    except (ValueError, TypeError, AttributeError):
+        # Une date invalide ne doit pas être considérée comme fiable.
+        return False
+
+
 def load_profile():
     try:
         with open(PROFILE_PATH, "r", encoding="utf-8") as file:
@@ -68,7 +123,10 @@ def load_profile():
 
 
 def get_company(workplace):
-    return (
+    if not isinstance(workplace, dict):
+        return ""
+
+    return str(
         workplace.get("brand")
         or workplace.get("name")
         or workplace.get("legal_name")
@@ -132,16 +190,17 @@ def get_target_locality(workplace):
     if not isinstance(location, dict):
         return ""
 
-    values = [
-        location.get("city"),
-        location.get("label"),
-        location.get("address"),
-    ]
+    # La ville déclarée est prioritaire : ne pas la remplacer
+    # par une autre commune trouvée dans l'adresse.
+    city = str(location.get("city") or "").strip()
+    if city:
+        return find_target_locality(city)
 
-    for value in values:
-        locality = find_target_locality(value or "")
-        if locality:
-            return locality
+    # Sans ville déclarée, utiliser le libellé puis l'adresse.
+    for value in (location.get("label"), location.get("address")):
+        value = str(value or "").strip()
+        if value:
+            return find_target_locality(value)
 
     return ""
 
@@ -254,7 +313,8 @@ def get_technical_evidence_score(description):
 def get_domain_match_score(title, workplace, is_job):
     """
     Évalue la correspondance avec le développement informatique.
-    Maximum : 10 points.
+    10 points : développement.
+    5 points : métier informatique complémentaire.
     """
     if not is_job:
         naf_code, _ = get_activity_info(workplace)
@@ -280,7 +340,23 @@ def get_domain_match_score(title, workplace, is_job):
         "logiciel",
     )
 
-    return 10 if any(term in text for term in developer_terms) else 0
+    if any(term in text for term in developer_terms):
+        return 10
+
+    related_it_terms = (
+        "informatique",
+        "technicien",
+        "support",
+        "systèmes d'information",
+        "systemes d'information",
+        "administrateur système",
+        "administrateur systèmes",
+    )
+
+    if any(term in text for term in related_it_terms):
+        return 5
+
+    return 0
 
 
 
@@ -490,6 +566,39 @@ def make_internal_url(kind, identifier):
     return f"botboss://la-bonne-alternance/{kind}/{safe_id}"
 
 
+
+def deduplicate_records(records):
+    """Supprime les doublons à partir des identifiants API."""
+    unique = {}
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+
+        identifier = record.get("identifier")
+        if not isinstance(identifier, dict):
+            identifier = {}
+
+        record_id = (
+            identifier.get("id")
+            or identifier.get("partner_job_id")
+        )
+
+        if record_id:
+            key = str(record_id)
+        else:
+            key = json.dumps(
+                record,
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+
+        if key not in unique:
+            unique[key] = record
+
+    return list(unique.values())
+
+
 def search_lba(include_recruiters=True, dry_run=False):
     api_key = os.getenv("LBA_API_KEY", "").strip()
 
@@ -502,41 +611,77 @@ def search_lba(include_recruiters=True, dry_run=False):
         "Accept": "application/json",
     }
 
-    params = [("romes", ROME_CODES)]
-    params.extend(
-        ("departements", department)
-        for department in DEPARTMENTS
-    )
-
     print("Recherche auprès de La Bonne Alternance...")
     print("Départements :", ", ".join(DEPARTMENTS))
-    print("Métiers ROME :", ROME_CODES)
+    print("Métiers ROME :", ", ".join(ROME_CODES))
+
+    all_jobs = []
+    all_recruiters = []
 
     try:
-        response = requests.get(
-            API_URL,
-            headers=headers,
-            params=params,
-            timeout=REQUEST_TIMEOUT,
-        )
+        for rome_code in ROME_CODES:
+            params = [("romes", rome_code)]
+            params.extend(
+                ("departements", department)
+                for department in DEPARTMENTS
+            )
 
-        if response.status_code == 401:
-            print("Erreur 401 : clé API absente, invalide ou expirée.")
-            return
+            print(f"Recherche du code ROME {rome_code}...")
 
-        if response.status_code == 403:
-            print("Erreur 403 : accès refusé pour cette clé API.")
-            return
+            response = requests.get(
+                API_URL,
+                headers=headers,
+                params=params,
+                timeout=REQUEST_TIMEOUT,
+            )
 
-        if response.status_code == 419:
-            print("Erreur 419 : limite de requêtes atteinte.")
-            return
+            if response.status_code == 401:
+                print("Erreur 401 : clé API absente, invalide ou expirée.")
+                return
 
-        response.raise_for_status()
-        data = response.json()
+            if response.status_code == 403:
+                print("Erreur 403 : accès refusé pour cette clé API.")
+                return
+
+            if response.status_code == 419:
+                print("Erreur 419 : limite de requêtes atteinte.")
+                return
+
+            response.raise_for_status()
+            data = response.json()
+
+            if not isinstance(data, dict):
+                print("Erreur : format de réponse API invalide.")
+                return
+
+            jobs = data.get("jobs", [])
+            recruiters = data.get("recruiters", [])
+
+            if not isinstance(jobs, list):
+                print("Erreur : la liste des offres API est invalide.")
+                return
+
+            if not isinstance(recruiters, list):
+                print("Erreur : la liste des recruteurs API est invalide.")
+                return
+
+            all_jobs.extend(jobs)
+            all_recruiters.extend(recruiters)
+
+        data = {
+            "jobs": deduplicate_records(all_jobs),
+            "recruiters": deduplicate_records(all_recruiters),
+        }
+
+        print("Offres uniques trouvées :", len(data["jobs"]))
+        print("Recruteurs uniques trouvés :", len(data["recruiters"]))
 
     except requests.Timeout:
         print("Erreur : délai dépassé pendant la connexion à l'API.")
+        return
+
+    except requests.exceptions.JSONDecodeError:
+        print("Erreur : la réponse de l'API n'est pas un JSON valide.")
         return
 
     except requests.RequestException as error:
@@ -558,10 +703,26 @@ def search_lba(include_recruiters=True, dry_run=False):
     # --------------------------------------------------
 
     for job in data.get("jobs", []):
-        workplace = job.get("workplace") or {}
-        offer = job.get("offer") or {}
-        identifier = job.get("identifier") or {}
-        apply = job.get("apply") or {}
+        if not isinstance(job, dict):
+            skipped += 1
+            continue
+
+        workplace = job.get("workplace")
+        offer = job.get("offer")
+        identifier = job.get("identifier")
+        apply = job.get("apply")
+
+        if not all(
+            isinstance(value, dict)
+            for value in (workplace, offer, identifier, apply)
+        ):
+            skipped += 1
+            continue
+
+        # Refuser les offres inactives ou expirées.
+        if not is_offer_available(offer):
+            skipped += 1
+            continue
 
         company = get_company(workplace)
         locality = get_target_locality(workplace)
@@ -580,9 +741,12 @@ def search_lba(include_recruiters=True, dry_run=False):
             skipped += 1
             continue
 
-        title = offer.get("title") or (
-            "Alternance en développement informatique"
-        )
+        title = str(offer.get("title") or "").strip()
+
+        # Refuser les annonces sans véritable intitulé de poste.
+        if not title:
+            skipped += 1
+            continue
 
         description = (
             offer.get("description")
@@ -614,7 +778,7 @@ def search_lba(include_recruiters=True, dry_run=False):
 
         application_url = apply.get("url") or ""
 
-        if not application_url or not application_url.startswith(("https://", "http://")):
+        if not is_valid_web_url(application_url):
             skipped += 1
             continue
 
@@ -659,9 +823,20 @@ def search_lba(include_recruiters=True, dry_run=False):
 
     if include_recruiters:
         for recruiter in data.get("recruiters", []):
-            workplace = recruiter.get("workplace") or {}
-            identifier = recruiter.get("identifier") or {}
-            apply = recruiter.get("apply") or {}
+            if not isinstance(recruiter, dict):
+                skipped += 1
+                continue
+
+            workplace = recruiter.get("workplace")
+            identifier = recruiter.get("identifier")
+            apply = recruiter.get("apply")
+
+            if not all(
+                isinstance(value, dict)
+                for value in (workplace, identifier, apply)
+            ):
+                skipped += 1
+                continue
 
             company = get_company(workplace)
             recruiter_id = identifier.get("id")

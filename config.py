@@ -69,7 +69,11 @@ TARGET_LOCALITIES = [
     "Airaines",
 ]
 
-SEARCH_AREAS = TARGET_LOCALITIES
+SEARCH_AREAS = [
+    "Rouen",
+    "Amiens",
+]
+
 JOB_TERMS = [
     "alternance développeur web",
     "alternance développeur logiciel",
